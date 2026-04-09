@@ -104,21 +104,265 @@ load-secrets() {
     return 0
 }
 
+# Get password from PowerShell popup (never visible in terminal/context)
+_get-secrets-password() {
+    local pw
+    pw=$(powershell -NoProfile -Command '
+        Add-Type -AssemblyName System.Windows.Forms
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text = "Secrets Password"
+        $form.Size = New-Object System.Drawing.Size(350,150)
+        $form.StartPosition = "CenterScreen"
+        $form.TopMost = $true
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = "Enter secrets password:"
+        $label.Location = New-Object System.Drawing.Point(10,15)
+        $label.Size = New-Object System.Drawing.Size(310,20)
+        $form.Controls.Add($label)
+        $box = New-Object System.Windows.Forms.TextBox
+        $box.UseSystemPasswordChar = $true
+        $box.Location = New-Object System.Drawing.Point(10,40)
+        $box.Size = New-Object System.Drawing.Size(310,20)
+        $form.Controls.Add($box)
+        $btn = New-Object System.Windows.Forms.Button
+        $btn.Text = "OK"
+        $btn.Location = New-Object System.Drawing.Point(130,70)
+        $btn.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $form.AcceptButton = $btn
+        $form.Controls.Add($btn)
+        $result = $form.ShowDialog()
+        if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+            Write-Output $box.Text
+        }
+        $form.Dispose()
+    ' 2>/dev/null)
+    echo "$pw"
+}
+
+# Load secrets into env vars WITHOUT writing plaintext to disk
+load-secrets-secure() {
+    if [ ! -f "$ENCRYPTED_FILE" ]; then
+        echo -e "${RED}Error: $ENCRYPTED_FILE not found!${NC}"
+        return 1
+    fi
+
+    echo "Requesting password..."
+    local password
+    password=$(_get-secrets-password)
+
+    if [ -z "$password" ]; then
+        echo -e "${RED}No password provided.${NC}"
+        return 1
+    fi
+
+    echo "Decrypting to memory..."
+    local decrypted
+    decrypted=$(openssl enc -aes-256-cbc -d -pbkdf2 -in "$ENCRYPTED_FILE" -pass "pass:$password" 2>/dev/null)
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to decrypt. Wrong password?${NC}"
+        return 1
+    fi
+
+    # Parse and export env vars from decrypted content (never touches disk)
+    local count=0
+    while IFS= read -r line; do
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        # Split on first = only
+        local key="${line%%=*}"
+        local value="${line#*=}"
+        # Remove surrounding quotes if present
+        value="${value%\"}"
+        value="${value#\"}"
+        value="${value%\'}"
+        value="${value#\'}"
+        export "$key=$value"
+        count=$((count + 1))
+    done <<< "$decrypted"
+
+    echo -e "${GREEN}Loaded $count secrets into environment (never written to disk)${NC}"
+    return 0
+}
+
+# Decrypt, run a command, re-encrypt. Plaintext exists only while command runs.
+# Usage: with-secrets <command...>
+# Example: with-secrets bun run start
+with-secrets() {
+    if [ $# -eq 0 ]; then
+        echo -e "${RED}Usage: with-secrets <command>${NC}"
+        echo "Example: with-secrets bun run start"
+        return 1
+    fi
+
+    if [ ! -f "$ENCRYPTED_FILE" ]; then
+        echo -e "${RED}Error: $ENCRYPTED_FILE not found!${NC}"
+        return 1
+    fi
+
+    echo "Requesting password..."
+    local password
+    password=$(_get-secrets-password)
+
+    if [ -z "$password" ]; then
+        echo -e "${RED}No password provided.${NC}"
+        return 1
+    fi
+
+    # Decrypt to disk (needed for --env-file)
+    if ! openssl enc -aes-256-cbc -d -pbkdf2 -in "$ENCRYPTED_FILE" -pass "pass:$password" -out "$SECRETS_FILE" 2>/dev/null; then
+        echo -e "${RED}Failed to decrypt. Wrong password?${NC}"
+        rm -f "$SECRETS_FILE" 2>/dev/null
+        return 1
+    fi
+
+    echo -e "${GREEN}Decrypted. Running: $*${NC}"
+
+    # Run the command — when it exits (or Ctrl+C), clean up
+    trap 'echo -e "\n${YELLOW}Cleaning up plaintext...${NC}"; shred -u "$SECRETS_FILE" 2>/dev/null || rm -f "$SECRETS_FILE"; echo -e "${GREEN}Plaintext deleted.${NC}"; trap - INT TERM EXIT' INT TERM EXIT
+
+    "$@"
+    local exit_code=$?
+
+    # Cleanup happens via trap, but do it explicitly too
+    shred -u "$SECRETS_FILE" 2>/dev/null || rm -f "$SECRETS_FILE"
+    trap - INT TERM EXIT
+
+    echo -e "${GREEN}Plaintext deleted. Secrets locked.${NC}"
+    return $exit_code
+}
+
+# Add or update a secret without exposing existing secrets in context
+# Usage: add-secret KEY VALUE
+# Decrypts to memory, adds/updates the line, re-encrypts. Plaintext never stays on disk.
+add-secret() {
+    if [ $# -ne 2 ]; then
+        echo -e "${RED}Usage: add-secret KEY VALUE${NC}"
+        echo "Example: add-secret MY_API_KEY abc123"
+        return 1
+    fi
+
+    local key="$1"
+    local value="$2"
+
+    if [ ! -f "$ENCRYPTED_FILE" ]; then
+        # No encrypted file yet — create one with just this secret
+        echo "$key=$value" | openssl enc -aes-256-cbc -salt -pbkdf2 -out "$ENCRYPTED_FILE" -pass "pass:$(_get-secrets-password)" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}Created $ENCRYPTED_FILE with $key${NC}"
+        else
+            echo -e "${RED}Failed to encrypt.${NC}"
+            return 1
+        fi
+        return 0
+    fi
+
+    echo "Requesting password..."
+    local password
+    password=$(_get-secrets-password)
+
+    if [ -z "$password" ]; then
+        echo -e "${RED}No password provided.${NC}"
+        return 1
+    fi
+
+    # Decrypt to memory
+    local decrypted
+    decrypted=$(openssl enc -aes-256-cbc -d -pbkdf2 -in "$ENCRYPTED_FILE" -pass "pass:$password" 2>/dev/null)
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to decrypt. Wrong password?${NC}"
+        return 1
+    fi
+
+    # Remove existing line for this key (if any), then add new one
+    local updated
+    updated=$(echo "$decrypted" | grep -v "^${key}=")
+    updated="${updated}"$'\n'"${key}=${value}"
+
+    # Re-encrypt (pipe, never written as plaintext file)
+    echo "$updated" | openssl enc -aes-256-cbc -salt -pbkdf2 -out "$ENCRYPTED_FILE" -pass "pass:$password" 2>/dev/null
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Secret '$key' added/updated and re-encrypted.${NC}"
+    else
+        echo -e "${RED}Failed to re-encrypt.${NC}"
+        return 1
+    fi
+}
+
+# Remove a secret by key name
+# Usage: remove-secret KEY
+remove-secret() {
+    if [ $# -ne 1 ]; then
+        echo -e "${RED}Usage: remove-secret KEY${NC}"
+        return 1
+    fi
+
+    local key="$1"
+
+    if [ ! -f "$ENCRYPTED_FILE" ]; then
+        echo -e "${RED}Error: $ENCRYPTED_FILE not found!${NC}"
+        return 1
+    fi
+
+    echo "Requesting password..."
+    local password
+    password=$(_get-secrets-password)
+
+    if [ -z "$password" ]; then
+        echo -e "${RED}No password provided.${NC}"
+        return 1
+    fi
+
+    local decrypted
+    decrypted=$(openssl enc -aes-256-cbc -d -pbkdf2 -in "$ENCRYPTED_FILE" -pass "pass:$password" 2>/dev/null)
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to decrypt. Wrong password?${NC}"
+        return 1
+    fi
+
+    # Check if key exists
+    if ! echo "$decrypted" | grep -q "^${key}="; then
+        echo -e "${YELLOW}Key '$key' not found in secrets.${NC}"
+        return 1
+    fi
+
+    # Remove the line and re-encrypt
+    local updated
+    updated=$(echo "$decrypted" | grep -v "^${key}=")
+
+    echo "$updated" | openssl enc -aes-256-cbc -salt -pbkdf2 -out "$ENCRYPTED_FILE" -pass "pass:$password" 2>/dev/null
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Secret '$key' removed and re-encrypted.${NC}"
+    else
+        echo -e "${RED}Failed to re-encrypt.${NC}"
+        return 1
+    fi
+}
+
 # Show available commands
 show-secrets-help() {
     echo "Secrets Manager Commands:"
-    echo "  unlock-secrets  - Decrypt $ENCRYPTED_FILE to $SECRETS_FILE"
-    echo "  lock-secrets    - Encrypt $SECRETS_FILE to $ENCRYPTED_FILE and delete plaintext"
-    echo "  toggle-secrets  - Auto lock/unlock based on current state"
-    echo "  load-secrets    - Load secrets into environment variables (more secure!)"
+    echo "  unlock-secrets       - Decrypt $ENCRYPTED_FILE to $SECRETS_FILE (manual lock needed)"
+    echo "  lock-secrets         - Encrypt $SECRETS_FILE to $ENCRYPTED_FILE and delete plaintext"
+    echo "  toggle-secrets       - Auto lock/unlock based on current state"
+    echo "  load-secrets         - Load from plaintext file into env vars"
+    echo "  load-secrets-secure  - Popup password, decrypt to env vars only (never writes to disk)"
+    echo "  with-secrets <cmd>   - Popup password, decrypt, run command, auto-delete plaintext"
+    echo "  add-secret KEY VAL   - Add/update a secret (decrypt to memory, modify, re-encrypt)"
+    echo "  remove-secret KEY    - Remove a secret by name"
     echo ""
     echo "Current status:"
     if [ -f "$SECRETS_FILE" ]; then
-        echo -e "  ${YELLOW}🔓 UNLOCKED${NC} - $SECRETS_FILE exists"
+        echo -e "  ${YELLOW}UNLOCKED${NC} - $SECRETS_FILE exists (plaintext on disk!)"
     else
-        echo -e "  ${GREEN}🔒 LOCKED${NC} - Secrets are encrypted"
+        echo -e "  ${GREEN}LOCKED${NC} - Secrets are encrypted"
     fi
 }
 
 echo -e "${GREEN}Secrets Manager loaded!${NC}"
-echo "Commands: unlock-secrets, lock-secrets, toggle-secrets, load-secrets, show-secrets-help"
+echo "Commands: unlock-secrets, lock-secrets, load-secrets-secure, with-secrets, show-secrets-help"

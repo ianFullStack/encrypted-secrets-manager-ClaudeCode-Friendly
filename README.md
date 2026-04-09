@@ -48,9 +48,14 @@ This re-encrypts everything and deletes the plaintext file.
 
 | Command | Description |
 |---------|-------------|
-| `unlock-secrets` | Decrypt secrets.env.enc → secrets.env |
+| `load-secrets-secure` | **(Recommended)** Popup password, decrypt to env vars in memory only — never writes plaintext to disk |
+| `with-secrets <cmd>` | **(Recommended)** Popup password, decrypt, run command, auto-delete plaintext when command exits |
+| `add-secret KEY VALUE` | Add or update a secret without exposing existing secrets — decrypts to memory, modifies, re-encrypts |
+| `remove-secret KEY` | Remove a secret by name |
+| `unlock-secrets` | Decrypt secrets.env.enc → secrets.env (manual flow, requires interactive terminal) |
 | `lock-secrets` | Encrypt secrets.env → secrets.env.enc (deletes plaintext) |
 | `toggle-secrets` | Smart toggle - locks if unlocked, unlocks if locked |
+| `load-secrets` | Load from existing plaintext file into env vars |
 | `show-secrets-help` | Show status and available commands |
 
 ## 🔐 Security Features
@@ -59,17 +64,41 @@ This re-encrypts everything and deletes the plaintext file.
 ✅ **AES-256-CBC encryption** - Industry-standard encryption via OpenSSL
 ✅ **PBKDF2 key derivation** - Password stretching for brute-force resistance
 ✅ **Secure deletion** - Uses `shred` when available
-✅ **Session-based** - Only decrypted when you're actively working
+✅ **Memory-only decryption** - `load-secrets-secure` keeps plaintext entirely off disk
+✅ **PowerShell GUI password popup** - Password never appears in terminal output or AI context window
+✅ **Auto-cleanup** - `with-secrets` deletes plaintext on command exit (even on Ctrl+C, via bash trap)
+✅ **In-place secret editing** - `add-secret`/`remove-secret` modify the encrypted file without ever writing plaintext
 
-## 🎯 Use With Claude
+## 🎯 Use With Claude Code
 
-When starting a session with me:
-1. You: "Unlock my secrets" + provide your password
-2. Me: I decrypt and confirm
-3. You: Leave me to work - I'll read from `secrets.env` as needed
-4. You: "Lock them back up" when done
+### Recommended (secure) workflow
 
-This way you can leave me to work autonomously without repeated password prompts!
+**Load secrets into a Claude Code session without ever writing plaintext to disk:**
+```bash
+source ~/secrets-manager.sh && load-secrets-secure
+```
+A password popup appears. After entering it, all secrets are loaded into environment variables in memory. Claude can use `$VARIABLE_NAME` references but never sees the file or the values directly (unless explicitly asked to print them).
+
+**Run a command (e.g., start a bot) with secrets, auto-cleaning on exit:**
+```bash
+source ~/secrets-manager.sh && with-secrets bun run start
+```
+This decrypts to disk briefly, runs your command, and shreds the plaintext when the command exits — even if you Ctrl+C.
+
+**Add or update a secret without exposing existing ones:**
+```bash
+source ~/secrets-manager.sh && add-secret NEW_API_KEY abc123
+```
+
+### How the password popup works
+
+Passwords are entered via a **PowerShell Windows Forms popup** with a masked password field. The password value goes from the GUI directly to OpenSSL via bash variable — it never appears in terminal output, command history, or any AI tool's context window. This is critical when working with Claude Code: even if Claude proxies the command, the password remains invisible.
+
+### Why memory-only decryption matters
+
+The original `unlock-secrets` flow writes a plaintext `secrets.env` file to disk. If you forget to `lock-secrets`, the file sits there exposed. `load-secrets-secure` eliminates this risk entirely — the decrypted content exists only in the bash process's memory and disappears when the shell exits.
+
+For long-running processes that need a real env file (like `bun run --env-file secrets.env`), use `with-secrets` instead. It writes to disk only for the duration of the wrapped command and uses a bash trap to guarantee cleanup on exit, crash, or interrupt.
 
 ## 📝 Notes
 
