@@ -92,7 +92,19 @@ source ~/secrets-manager.sh && add-secret NEW_API_KEY abc123
 
 ### How the password popup works
 
-Passwords are entered via a **PowerShell Windows Forms popup** with a masked password field. The password value goes from the GUI directly to OpenSSL via bash variable — it never appears in terminal output, command history, or any AI tool's context window. This is critical when working with Claude Code: even if Claude proxies the command, the password remains invisible.
+Passwords are entered via a **GUI popup with a masked password field** — never typed into the terminal. The password value goes from the GUI directly to OpenSSL via a bash variable, so it never appears in terminal output, shell history, or any AI tool's context window. This is critical when working with Claude Code: even if Claude proxies the command, the password remains invisible.
+
+**Cross-platform support** — `_get-secrets-password` auto-detects your OS and uses the right native dialog:
+
+| OS | Tool used | Requirements |
+|----|-----------|--------------|
+| Windows (Git Bash / MSYS / Cygwin) | PowerShell + Windows Forms | Built-in (no install needed) |
+| macOS | `osascript` (AppleScript) | Built-in (no install needed) |
+| Linux (GNOME) | `zenity` | `sudo apt install zenity` |
+| Linux (KDE) | `kdialog` | `sudo apt install kdialog` |
+| Linux (headless) or unknown OS | Silent terminal `read -s` | Requires interactive TTY |
+
+If no GUI tool is available, it falls back to a silent terminal prompt (`read -s`) so the password still doesn't echo to the screen.
 
 ### Why memory-only decryption matters
 

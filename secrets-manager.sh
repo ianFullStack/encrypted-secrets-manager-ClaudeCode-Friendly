@@ -104,38 +104,88 @@ load-secrets() {
     return 0
 }
 
-# Get password from PowerShell popup (never visible in terminal/context)
+# Get password via GUI popup, cross-platform (never visible in terminal/context)
+# Detection order: Windows (PowerShell) > macOS (osascript) > Linux (zenity/kdialog) > terminal fallback (read -s)
 _get-secrets-password() {
     local pw
-    pw=$(powershell -NoProfile -Command '
-        Add-Type -AssemblyName System.Windows.Forms
-        $form = New-Object System.Windows.Forms.Form
-        $form.Text = "Secrets Password"
-        $form.Size = New-Object System.Drawing.Size(350,150)
-        $form.StartPosition = "CenterScreen"
-        $form.TopMost = $true
-        $label = New-Object System.Windows.Forms.Label
-        $label.Text = "Enter secrets password:"
-        $label.Location = New-Object System.Drawing.Point(10,15)
-        $label.Size = New-Object System.Drawing.Size(310,20)
-        $form.Controls.Add($label)
-        $box = New-Object System.Windows.Forms.TextBox
-        $box.UseSystemPasswordChar = $true
-        $box.Location = New-Object System.Drawing.Point(10,40)
-        $box.Size = New-Object System.Drawing.Size(310,20)
-        $form.Controls.Add($box)
-        $btn = New-Object System.Windows.Forms.Button
-        $btn.Text = "OK"
-        $btn.Location = New-Object System.Drawing.Point(130,70)
-        $btn.DialogResult = [System.Windows.Forms.DialogResult]::OK
-        $form.AcceptButton = $btn
-        $form.Controls.Add($btn)
-        $result = $form.ShowDialog()
-        if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-            Write-Output $box.Text
-        }
-        $form.Dispose()
-    ' 2>/dev/null)
+    local os
+    os="$(uname -s 2>/dev/null || echo unknown)"
+
+    case "$os" in
+        # Windows variants under Git Bash, MSYS, Cygwin
+        MINGW*|MSYS*|CYGWIN*|Windows_NT)
+            pw=$(powershell -NoProfile -Command '
+                Add-Type -AssemblyName System.Windows.Forms
+                $form = New-Object System.Windows.Forms.Form
+                $form.Text = "Secrets Password"
+                $form.Size = New-Object System.Drawing.Size(350,150)
+                $form.StartPosition = "CenterScreen"
+                $form.TopMost = $true
+                $label = New-Object System.Windows.Forms.Label
+                $label.Text = "Enter secrets password:"
+                $label.Location = New-Object System.Drawing.Point(10,15)
+                $label.Size = New-Object System.Drawing.Size(310,20)
+                $form.Controls.Add($label)
+                $box = New-Object System.Windows.Forms.TextBox
+                $box.UseSystemPasswordChar = $true
+                $box.Location = New-Object System.Drawing.Point(10,40)
+                $box.Size = New-Object System.Drawing.Size(310,20)
+                $form.Controls.Add($box)
+                $btn = New-Object System.Windows.Forms.Button
+                $btn.Text = "OK"
+                $btn.Location = New-Object System.Drawing.Point(130,70)
+                $btn.DialogResult = [System.Windows.Forms.DialogResult]::OK
+                $form.AcceptButton = $btn
+                $form.Controls.Add($btn)
+                $result = $form.ShowDialog()
+                if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+                    Write-Output $box.Text
+                }
+                $form.Dispose()
+            ' 2>/dev/null)
+            ;;
+
+        # macOS — use AppleScript via osascript
+        Darwin)
+            pw=$(osascript -e 'tell application "System Events"
+                activate
+                set thePassword to text returned of (display dialog "Enter secrets password:" default answer "" with title "Secrets Password" with hidden answer)
+            end tell' 2>/dev/null)
+            ;;
+
+        # Linux — try zenity, then kdialog, then fall back to terminal read
+        Linux)
+            if command -v zenity >/dev/null 2>&1; then
+                pw=$(zenity --password --title="Secrets Password" 2>/dev/null)
+            elif command -v kdialog >/dev/null 2>&1; then
+                pw=$(kdialog --title "Secrets Password" --password "Enter secrets password:" 2>/dev/null)
+            else
+                # Headless or no GUI dialog available — read from terminal silently
+                # Note: requires an interactive TTY
+                if [ -t 0 ]; then
+                    echo -n "Enter secrets password: " >&2
+                    read -rs pw
+                    echo "" >&2
+                else
+                    echo "Error: No GUI dialog available (install zenity or kdialog) and no interactive terminal." >&2
+                    return 1
+                fi
+            fi
+            ;;
+
+        *)
+            # Unknown OS — try terminal read as last resort
+            if [ -t 0 ]; then
+                echo -n "Enter secrets password: " >&2
+                read -rs pw
+                echo "" >&2
+            else
+                echo "Error: Unsupported OS '$os' and no interactive terminal." >&2
+                return 1
+            fi
+            ;;
+    esac
+
     echo "$pw"
 }
 
