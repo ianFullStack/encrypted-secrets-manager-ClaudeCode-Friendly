@@ -236,52 +236,15 @@ load-secrets-secure() {
     return 0
 }
 
-# Decrypt, run a command, re-encrypt. Plaintext exists only while command runs.
-# Usage: with-secrets <command...>
-# Example: with-secrets bun run start
-with-secrets() {
-    if [ $# -eq 0 ]; then
-        echo -e "${RED}Usage: with-secrets <command>${NC}"
-        echo "Example: with-secrets bun run start"
-        return 1
-    fi
-
-    if [ ! -f "$ENCRYPTED_FILE" ]; then
-        echo -e "${RED}Error: $ENCRYPTED_FILE not found!${NC}"
-        return 1
-    fi
-
-    echo "Requesting password..."
-    local password
-    password=$(_get-secrets-password)
-
-    if [ -z "$password" ]; then
-        echo -e "${RED}No password provided.${NC}"
-        return 1
-    fi
-
-    # Decrypt to disk (needed for --env-file)
-    if ! openssl enc -aes-256-cbc -d -pbkdf2 -in "$ENCRYPTED_FILE" -pass "pass:$password" -out "$SECRETS_FILE" 2>/dev/null; then
-        echo -e "${RED}Failed to decrypt. Wrong password?${NC}"
-        rm -f "$SECRETS_FILE" 2>/dev/null
-        return 1
-    fi
-
-    echo -e "${GREEN}Decrypted. Running: $*${NC}"
-
-    # Run the command — when it exits (or Ctrl+C), clean up
-    trap 'echo -e "\n${YELLOW}Cleaning up plaintext...${NC}"; shred -u "$SECRETS_FILE" 2>/dev/null || rm -f "$SECRETS_FILE"; echo -e "${GREEN}Plaintext deleted.${NC}"; trap - INT TERM EXIT' INT TERM EXIT
-
-    "$@"
-    local exit_code=$?
-
-    # Cleanup happens via trap, but do it explicitly too
-    shred -u "$SECRETS_FILE" 2>/dev/null || rm -f "$SECRETS_FILE"
-    trap - INT TERM EXIT
-
-    echo -e "${GREEN}Plaintext deleted. Secrets locked.${NC}"
-    return $exit_code
-}
+# NOTE: `with-secrets` was removed in 2026-04-16. It decrypted to disk for the
+# duration of a wrapped command. The recommended pattern now is:
+#
+#   load-secrets-secure       # decrypt to env vars in memory only (no disk)
+#   exec <your command>       # inherits env vars from the parent shell
+#
+# This keeps plaintext entirely off disk. See start-secure.sh in your project
+# for an example. If you need the old behavior for a one-off command, use:
+#   unlock-secrets && <command> && lock-secrets
 
 # Add or update a secret without exposing existing secrets in context
 # Usage: add-secret KEY VALUE
@@ -326,9 +289,18 @@ add-secret() {
         return 1
     fi
 
-    # Remove existing line for this key (if any), then add new one
+    # Remove existing line for this key (if any)
     local updated
     updated=$(echo "$decrypted" | grep -v "^${key}=")
+
+    # Add a "Custom" section header on first add (gives blank line separation
+    # from previous categories and keeps additions visually grouped)
+    local custom_hdr="# Custom secrets (added via add-secret/add-secret-gui)"
+    if ! echo "$updated" | grep -qF "$custom_hdr"; then
+        updated="${updated}"$'\n\n'"${custom_hdr}"
+    fi
+
+    # Append the new key on its own line
     updated="${updated}"$'\n'"${key}=${value}"
 
     # Re-encrypt (pipe, never written as plaintext file)
@@ -566,9 +538,18 @@ add-secret-gui() {
         echo -e "${YELLOW}Note: '$key' already exists and will be overwritten.${NC}"
     fi
 
-    # Remove existing line for this key (if any), then add new one
+    # Remove existing line for this key (if any)
     local updated
     updated=$(echo "$decrypted" | grep -v "^${key}=")
+
+    # Add a "Custom" section header on first add (gives blank line separation
+    # from previous categories and keeps additions visually grouped)
+    local custom_hdr="# Custom secrets (added via add-secret/add-secret-gui)"
+    if ! echo "$updated" | grep -qF "$custom_hdr"; then
+        updated="${updated}"$'\n\n'"${custom_hdr}"
+    fi
+
+    # Append the new key on its own line
     updated="${updated}"$'\n'"${key}=${value}"
 
     # Re-encrypt (pipe, never written as plaintext file)
@@ -642,7 +623,6 @@ show-secrets-help() {
     echo "  toggle-secrets       - Auto lock/unlock based on current state"
     echo "  load-secrets         - Load from plaintext file into env vars"
     echo "  load-secrets-secure  - Popup password, decrypt to env vars only (never writes to disk)"
-    echo "  with-secrets <cmd>   - Popup password, decrypt, run command, auto-delete plaintext"
     echo "  add-secret KEY VAL   - Add/update a secret (decrypt to memory, modify, re-encrypt)"
     echo "  add-secret-gui       - GUI popup form: name + value + confirm value (no command typing)"
     echo "  remove-secret KEY    - Remove a secret by name"
@@ -656,4 +636,4 @@ show-secrets-help() {
 }
 
 echo -e "${GREEN}Secrets Manager loaded!${NC}"
-echo "Commands: unlock-secrets, lock-secrets, load-secrets-secure, with-secrets, add-secret-gui, show-secrets-help"
+echo "Commands: unlock-secrets, lock-secrets, load-secrets-secure, add-secret-gui, show-secrets-help"

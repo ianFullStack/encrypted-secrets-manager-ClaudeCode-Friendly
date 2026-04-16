@@ -49,7 +49,7 @@ This re-encrypts everything and deletes the plaintext file.
 | Command | Description |
 |---------|-------------|
 | `load-secrets-secure` | **(Recommended)** Popup password, decrypt to env vars in memory only — never writes plaintext to disk |
-| `with-secrets <cmd>` | **(Recommended)** Popup password, decrypt, run command, auto-delete plaintext when command exits |
+| `<your-startup-script>.sh` | **(Recommended)** A shell script that runs `load-secrets-secure` then `exec <your-command>` — env vars inherit, plaintext never written to disk. See "Long-running processes" below. |
 | `add-secret-gui` | **(Recommended)** GUI form to add a new secret — name + value + confirm value, all via popup. Value never appears in shell history or AI context. |
 | `add-secret KEY VALUE` | CLI version of adding a secret — exposes value in shell history |
 | `remove-secret KEY` | Remove a secret by name |
@@ -68,7 +68,7 @@ This re-encrypts everything and deletes the plaintext file.
 ✅ **Memory-only decryption** - `load-secrets-secure` keeps plaintext entirely off disk
 ✅ **PowerShell GUI password popup** - Password never appears in terminal output or AI context window
 ✅ **GUI form for adding secrets** - `add-secret-gui` keeps new secret values out of shell history and AI context
-✅ **Auto-cleanup** - `with-secrets` deletes plaintext on command exit (even on Ctrl+C, via bash trap)
+✅ **No plaintext on disk for long-running processes** - the recommended pattern uses `load-secrets-secure` + `exec`, so env vars are inherited by the bot/server with zero disk writes
 ✅ **In-place secret editing** - `add-secret`/`remove-secret` modify the encrypted file without ever writing plaintext
 
 ## 🎯 Use With Claude Code
@@ -81,11 +81,11 @@ source ~/secrets-manager.sh && load-secrets-secure
 ```
 A password popup appears. After entering it, all secrets are loaded into environment variables in memory. Claude can use `$VARIABLE_NAME` references but never sees the file or the values directly (unless explicitly asked to print them).
 
-**Run a command (e.g., start a bot) with secrets, auto-cleaning on exit:**
+**Run a long-running process (bot, server) with secrets — plaintext never on disk:**
 ```bash
-source ~/secrets-manager.sh && with-secrets bun run start
+source ~/secrets-manager.sh && load-secrets-secure && exec bun run start
 ```
-This decrypts to disk briefly, runs your command, and shreds the plaintext when the command exits — even if you Ctrl+C.
+The decrypted secrets live in env vars in your shell. `exec` replaces the shell with your bot, which inherits the env vars. No plaintext file is ever created. Wrap this in a startup script (e.g., `start.sh`) for one-command launches.
 
 **Add a new secret without exposing the value to anyone (preferred):**
 ```bash
@@ -118,7 +118,18 @@ If no GUI tool is available, it falls back to a silent terminal prompt (`read -s
 
 The original `unlock-secrets` flow writes a plaintext `secrets.env` file to disk. If you forget to `lock-secrets`, the file sits there exposed. `load-secrets-secure` eliminates this risk entirely — the decrypted content exists only in the bash process's memory and disappears when the shell exits.
 
-For long-running processes that need a real env file (like `bun run --env-file secrets.env`), use `with-secrets` instead. It writes to disk only for the duration of the wrapped command and uses a bash trap to guarantee cleanup on exit, crash, or interrupt.
+For long-running processes (bots, servers, daemons), wrap the start command in a script that uses `load-secrets-secure` followed by `exec`. The env vars are inherited by the child process — no plaintext file ever exists. Example `start.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+source ~/secrets-manager.sh
+load-secrets-secure
+exec bun run start
+```
+
+This is strictly more secure than `--env-file` flows because there's no plaintext file to forget about, no race conditions on cleanup, and no exposure during a crash.
 
 ---
 
@@ -158,10 +169,11 @@ Users will ask you to use their API keys, passwords, and credentials for tasks l
 cd <dir-with-secrets.env.enc> && source ~/secrets-manager.sh && load-secrets-secure && curl -H "Authorization: Bearer $OPENAI_API_KEY" https://api.openai.com/v1/models
 ```
 
-**Start a long-running process with auto-cleanup:**
+**Start a long-running process with no plaintext on disk:**
 ```bash
-cd <dir> && source ~/secrets-manager.sh && with-secrets bun run start
+cd <dir> && source ~/secrets-manager.sh && load-secrets-secure && exec bun run start
 ```
+Or wrap this in a `start.sh` script for one-command launches. The bot inherits env vars from the parent shell.
 
 **Add a new secret (user value never enters your context):**
 ```bash
@@ -193,7 +205,7 @@ This project uses the encrypted-secrets-manager. Secrets are in `secrets.env.enc
 - Reference secrets as `$VARIABLE_NAME` in shell commands
 - To use secrets: `cd <dir> && source ~/secrets-manager.sh && load-secrets-secure && <command>`
 - To add a new secret: `cd <dir> && source ~/secrets-manager.sh && add-secret-gui` (preferred — no value typing)
-- To start the bot: `cd <dir> && source ~/secrets-manager.sh && with-secrets <command>` (auto-cleans on exit)
+- To start a long-running process: `cd <dir> && source ~/secrets-manager.sh && load-secrets-secure && exec <command>` (or wrap in a `start.sh` script — env vars inherit, no plaintext on disk)
 
 Full instructions in this repo's README.md.
 ```
