@@ -342,6 +342,246 @@ add-secret() {
     fi
 }
 
+# GUI popup for entering a new secret: name + value + confirm value
+# Returns "KEY=VALUE" on stdout if user confirms with matching values, empty on cancel/mismatch
+_get-new-secret-input() {
+    local result
+    local os
+    os="$(uname -s 2>/dev/null || echo unknown)"
+
+    case "$os" in
+        # Windows variants under Git Bash, MSYS, Cygwin
+        MINGW*|MSYS*|CYGWIN*|Windows_NT)
+            result=$(powershell -NoProfile -Command '
+                Add-Type -AssemblyName System.Windows.Forms
+                Add-Type -AssemblyName System.Drawing
+
+                while ($true) {
+                    $form = New-Object System.Windows.Forms.Form
+                    $form.Text = "Add New Secret"
+                    $form.Size = New-Object System.Drawing.Size(380,260)
+                    $form.StartPosition = "CenterScreen"
+                    $form.TopMost = $true
+                    $form.FormBorderStyle = "FixedDialog"
+                    $form.MaximizeBox = $false
+                    $form.MinimizeBox = $false
+
+                    $lblName = New-Object System.Windows.Forms.Label
+                    $lblName.Text = "Secret Name (e.g. MY_API_KEY):"
+                    $lblName.Location = New-Object System.Drawing.Point(15,15)
+                    $lblName.Size = New-Object System.Drawing.Size(340,18)
+                    $form.Controls.Add($lblName)
+
+                    $boxName = New-Object System.Windows.Forms.TextBox
+                    $boxName.Location = New-Object System.Drawing.Point(15,35)
+                    $boxName.Size = New-Object System.Drawing.Size(340,22)
+                    $boxName.CharacterCasing = "Upper"
+                    $form.Controls.Add($boxName)
+
+                    $lblVal = New-Object System.Windows.Forms.Label
+                    $lblVal.Text = "Secret Value:"
+                    $lblVal.Location = New-Object System.Drawing.Point(15,68)
+                    $lblVal.Size = New-Object System.Drawing.Size(340,18)
+                    $form.Controls.Add($lblVal)
+
+                    $boxVal = New-Object System.Windows.Forms.TextBox
+                    $boxVal.UseSystemPasswordChar = $true
+                    $boxVal.Location = New-Object System.Drawing.Point(15,88)
+                    $boxVal.Size = New-Object System.Drawing.Size(340,22)
+                    $form.Controls.Add($boxVal)
+
+                    $lblConf = New-Object System.Windows.Forms.Label
+                    $lblConf.Text = "Confirm Value:"
+                    $lblConf.Location = New-Object System.Drawing.Point(15,121)
+                    $lblConf.Size = New-Object System.Drawing.Size(340,18)
+                    $form.Controls.Add($lblConf)
+
+                    $boxConf = New-Object System.Windows.Forms.TextBox
+                    $boxConf.UseSystemPasswordChar = $true
+                    $boxConf.Location = New-Object System.Drawing.Point(15,141)
+                    $boxConf.Size = New-Object System.Drawing.Size(340,22)
+                    $form.Controls.Add($boxConf)
+
+                    $btnOk = New-Object System.Windows.Forms.Button
+                    $btnOk.Text = "Save"
+                    $btnOk.Location = New-Object System.Drawing.Point(180,180)
+                    $btnOk.Size = New-Object System.Drawing.Size(80,28)
+                    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+                    $form.AcceptButton = $btnOk
+                    $form.Controls.Add($btnOk)
+
+                    $btnCancel = New-Object System.Windows.Forms.Button
+                    $btnCancel.Text = "Cancel"
+                    $btnCancel.Location = New-Object System.Drawing.Point(275,180)
+                    $btnCancel.Size = New-Object System.Drawing.Size(80,28)
+                    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+                    $form.CancelButton = $btnCancel
+                    $form.Controls.Add($btnCancel)
+
+                    $form.Add_Shown({ $boxName.Focus() })
+                    $r = $form.ShowDialog()
+
+                    if ($r -ne [System.Windows.Forms.DialogResult]::OK) {
+                        $form.Dispose()
+                        return
+                    }
+
+                    $name = $boxName.Text.Trim()
+                    $v1 = $boxVal.Text
+                    $v2 = $boxConf.Text
+                    $form.Dispose()
+
+                    if ([string]::IsNullOrEmpty($name)) {
+                        [System.Windows.Forms.MessageBox]::Show("Secret name cannot be empty.", "Error", "OK", "Error") | Out-Null
+                        continue
+                    }
+                    if ($name -notmatch "^[A-Za-z_][A-Za-z0-9_]*$") {
+                        [System.Windows.Forms.MessageBox]::Show("Secret name must start with a letter or underscore and contain only letters, numbers, and underscores.", "Error", "OK", "Error") | Out-Null
+                        continue
+                    }
+                    if ($v1 -ne $v2) {
+                        [System.Windows.Forms.MessageBox]::Show("Values do not match. Please try again.", "Error", "OK", "Error") | Out-Null
+                        continue
+                    }
+                    if ([string]::IsNullOrEmpty($v1)) {
+                        [System.Windows.Forms.MessageBox]::Show("Secret value cannot be empty.", "Error", "OK", "Error") | Out-Null
+                        continue
+                    }
+
+                    Write-Output "$name=$v1"
+                    return
+                }
+            ' 2>/dev/null)
+            ;;
+
+        # macOS — use AppleScript via osascript
+        Darwin)
+            local name v1 v2
+            name=$(osascript -e 'tell application "System Events"
+                activate
+                set theName to text returned of (display dialog "Secret Name (e.g. MY_API_KEY):" default answer "" with title "Add New Secret")
+            end tell' 2>/dev/null)
+            [ -z "$name" ] && return
+            v1=$(osascript -e "tell application \"System Events\"
+                activate
+                set theVal to text returned of (display dialog \"Enter value for $name:\" default answer \"\" with title \"Add New Secret\" with hidden answer)
+            end tell" 2>/dev/null)
+            [ -z "$v1" ] && return
+            v2=$(osascript -e "tell application \"System Events\"
+                activate
+                set theVal to text returned of (display dialog \"Confirm value for $name:\" default answer \"\" with title \"Add New Secret\" with hidden answer)
+            end tell" 2>/dev/null)
+            if [ "$v1" != "$v2" ]; then
+                osascript -e 'display dialog "Values do not match." with title "Error" buttons {"OK"}' 2>/dev/null
+                return
+            fi
+            result="$name=$v1"
+            ;;
+
+        # Linux — try zenity (kdialog has no easy multi-field form)
+        Linux)
+            if command -v zenity >/dev/null 2>&1; then
+                local form_out name v1 v2
+                form_out=$(zenity --forms --title="Add New Secret" \
+                    --text="Enter secret details" \
+                    --add-entry="Secret Name (e.g. MY_API_KEY)" \
+                    --add-password="Value" \
+                    --add-password="Confirm Value" \
+                    --separator="|" 2>/dev/null)
+                [ -z "$form_out" ] && return
+                IFS='|' read -r name v1 v2 <<< "$form_out"
+                if [ -z "$name" ]; then
+                    zenity --error --text="Secret name cannot be empty." 2>/dev/null
+                    return
+                fi
+                if [ "$v1" != "$v2" ]; then
+                    zenity --error --text="Values do not match." 2>/dev/null
+                    return
+                fi
+                result="$name=$v1"
+            else
+                echo "Error: zenity not installed. Install with: sudo apt install zenity" >&2
+                return 1
+            fi
+            ;;
+
+        *)
+            echo "Error: Unsupported OS '$os' for GUI input." >&2
+            return 1
+            ;;
+    esac
+
+    echo "$result"
+}
+
+# Add a secret via GUI popup (no command-line typing needed).
+# Pops up password prompt, then a form with Name / Value / Confirm Value fields.
+# Plaintext never touches disk — decrypt to memory, modify, re-encrypt.
+# Usage: add-secret-gui
+add-secret-gui() {
+    if [ ! -f "$ENCRYPTED_FILE" ]; then
+        echo -e "${RED}Error: $ENCRYPTED_FILE not found in current directory.${NC}"
+        echo "Make sure you're in the directory containing your encrypted secrets."
+        return 1
+    fi
+
+    echo "Requesting master password..."
+    local password
+    password=$(_get-secrets-password)
+
+    if [ -z "$password" ]; then
+        echo -e "${RED}No password provided.${NC}"
+        return 1
+    fi
+
+    # Verify password by attempting decrypt (so we don't pop up the form on bad password)
+    local decrypted
+    decrypted=$(openssl enc -aes-256-cbc -d -pbkdf2 -in "$ENCRYPTED_FILE" -pass "pass:$password" 2>/dev/null)
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to decrypt. Wrong password?${NC}"
+        return 1
+    fi
+
+    echo "Opening secret entry form..."
+    local entry
+    entry=$(_get-new-secret-input)
+
+    if [ -z "$entry" ]; then
+        echo -e "${YELLOW}Cancelled — no secret added.${NC}"
+        return 1
+    fi
+
+    # Parse KEY=VALUE
+    local key="${entry%%=*}"
+    local value="${entry#*=}"
+
+    if [ -z "$key" ] || [ -z "$value" ]; then
+        echo -e "${RED}Invalid entry from form.${NC}"
+        return 1
+    fi
+
+    # Check if key already exists — warn user
+    if echo "$decrypted" | grep -q "^${key}="; then
+        echo -e "${YELLOW}Note: '$key' already exists and will be overwritten.${NC}"
+    fi
+
+    # Remove existing line for this key (if any), then add new one
+    local updated
+    updated=$(echo "$decrypted" | grep -v "^${key}=")
+    updated="${updated}"$'\n'"${key}=${value}"
+
+    # Re-encrypt (pipe, never written as plaintext file)
+    echo "$updated" | openssl enc -aes-256-cbc -salt -pbkdf2 -out "$ENCRYPTED_FILE" -pass "pass:$password" 2>/dev/null
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Secret '$key' added/updated and re-encrypted.${NC}"
+    else
+        echo -e "${RED}Failed to re-encrypt.${NC}"
+        return 1
+    fi
+}
+
 # Remove a secret by key name
 # Usage: remove-secret KEY
 remove-secret() {
@@ -404,6 +644,7 @@ show-secrets-help() {
     echo "  load-secrets-secure  - Popup password, decrypt to env vars only (never writes to disk)"
     echo "  with-secrets <cmd>   - Popup password, decrypt, run command, auto-delete plaintext"
     echo "  add-secret KEY VAL   - Add/update a secret (decrypt to memory, modify, re-encrypt)"
+    echo "  add-secret-gui       - GUI popup form: name + value + confirm value (no command typing)"
     echo "  remove-secret KEY    - Remove a secret by name"
     echo ""
     echo "Current status:"
@@ -415,4 +656,4 @@ show-secrets-help() {
 }
 
 echo -e "${GREEN}Secrets Manager loaded!${NC}"
-echo "Commands: unlock-secrets, lock-secrets, load-secrets-secure, with-secrets, show-secrets-help"
+echo "Commands: unlock-secrets, lock-secrets, load-secrets-secure, with-secrets, add-secret-gui, show-secrets-help"
