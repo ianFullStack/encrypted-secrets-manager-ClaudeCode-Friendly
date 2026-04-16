@@ -44,12 +44,52 @@ lock-secrets
 
 This re-encrypts everything and deletes the plaintext file.
 
+## 🚀 Recommended: The Secrets Agent (one popup per session)
+
+The agent (`secrets-agent.ts`) is a long-running background process that holds your decrypted secrets in memory after one master-password entry. Subsequent commands across multiple shell invocations and Claude Code calls don't have to re-prompt — until either the idle timeout expires (default 30 min) or you explicitly stop it.
+
+**Category-based scoping**: secrets are grouped into categories (Wallets, TradingAPIs, Email, etc., defined in `secrets-categories.json`). Accessing a key in a new category triggers a fresh password popup — so an attacker who tricked Claude into requesting a Wallet key after you'd only authorized API keys would still hit a password wall.
+
+```bash
+# Start the agent (one master password popup)
+source ~/secrets-manager.sh && secrets-agent start
+
+# Subsequent shells / Claude Code calls just use:
+source ~/secrets-manager.sh && load-secrets-from-agent
+# (popup only if a NEW category is being requested)
+
+# For bot startup (load everything with one popup):
+source ~/secrets-manager.sh && load-secrets-from-agent --bulk
+
+# Stop the agent (forces re-auth on next use)
+source ~/secrets-manager.sh && secrets-agent stop
+```
+
+**Security properties:**
+- ✅ Decrypted secrets live in agent process memory only — never written to disk
+- ✅ TCP localhost on a random port + 256-bit token in `~/.secrets-agent/info.json` (perms 600)
+- ✅ Idle timeout (configurable via `SECRETS_AGENT_TTL_MS`) — agent exits, secrets gone, password required again
+- ✅ Category scoping — fresh popup when accessing keys in a new category
+- ✅ The `get`/`dump` CLI commands refuse to run directly (would leak values to terminal/AI context); only the bash wrapper is the public interface
+
+**Caveats (same as any user-space credential store):**
+- ⚠ Process memory readable via debugger / same-user malware
+- ⚠ Memory pages can be paged to swap → use BitLocker (Windows) / FileVault (macOS) / LUKS (Linux) so swap is encrypted
+- ⚠ The bash wrapper IS the public interface — never invoke `bun secrets-agent.ts get/dump` directly
+
+Configure categories by editing `~/secrets-categories.json`. Default categories: Wallets, TradingAPIs, Telegram, StockAPIs, Email, Payments, Wix, AI, Cloud, BotConfig, Other. Patterns use `*` as wildcard (case-insensitive).
+
 ## 📋 Commands
 
 | Command | Description |
 |---------|-------------|
-| `load-secrets-secure` | **(Recommended)** Popup password, decrypt to env vars in memory only — never writes plaintext to disk |
-| `<your-startup-script>.sh` | **(Recommended)** A shell script that runs `load-secrets-secure` then `exec <your-command>` — env vars inherit, plaintext never written to disk. See "Long-running processes" below. |
+| `secrets-agent start` | **(Recommended)** Start the agent — one popup unlocks the session, subsequent loads don't re-prompt |
+| `secrets-agent stop` | Stop the agent — forces re-auth on next use |
+| `secrets-agent status` | Show running state, idle time, unlocked categories |
+| `load-secrets-from-agent` | Load currently-unlocked secrets into env vars (auto-starts agent if not running) |
+| `load-secrets-from-agent --bulk` | Load ALL secrets via one popup (for bot startup) |
+| `load-secrets-secure` | Direct mode (no agent) — popup password, decrypt to env vars only — never writes plaintext to disk |
+| `<your-startup-script>.sh` | A shell script that runs `load-secrets-from-agent --bulk` then `exec <your-command>` — env vars inherit, plaintext never written to disk |
 | `add-secret-gui` | **(Recommended)** GUI form to add a new secret — name + value + confirm value, all via popup. Value never appears in shell history or AI context. |
 | `add-secret KEY VALUE` | CLI version of adding a secret — exposes value in shell history |
 | `remove-secret KEY` | Remove a secret by name |
@@ -118,6 +158,22 @@ If no GUI tool is available, it falls back to a silent terminal prompt (`read -s
 
 The original `unlock-secrets` flow writes a plaintext `secrets.env` file to disk. If you forget to `lock-secrets`, the file sits there exposed. `load-secrets-secure` eliminates this risk entirely — the decrypted content exists only in the bash process's memory and disappears when the shell exits.
 
+### Temporal isolation: every Claude bash call is a fresh shell
+
+This is one of the strongest security properties of using this system with Claude Code or similar AI tools, and it's worth understanding:
+
+**Each Bash tool call from Claude spawns a brand-new bash process.** Env vars set in one call do not exist in the next call. They die with the bash process when the command completes.
+
+That means a chained command like:
+```bash
+cd ~ && source ~/secrets-manager.sh && load-secrets-from-agent && curl -H "Bearer $KEY" ...
+```
+loads the secret, uses it via `$KEY`, and immediately discards it. **Claude's next bash call starts with zero env vars** — `echo $KEY` would print an empty line.
+
+So even if Claude is later tricked (e.g., by a prompt injection in a webpage it summarizes) into running `echo $KEY` or `env | grep API`, the command runs in a fresh bash with no secrets loaded. The "trick Claude into echoing" attack window is only the duration of a single chained command — not the duration of the whole conversation.
+
+The agent extends this: secrets persist in the AGENT's memory between Claude calls so you don't re-prompt for the password, but Claude itself never holds the values in its bash sessions. Claude's bash needs to actively pull from the agent each time, and the agent's wrapper guarantees the values go straight into env vars via `eval` without passing through any visible output.
+
 For long-running processes (bots, servers, daemons), wrap the start command in a script that uses `load-secrets-secure` followed by `exec`. The env vars are inherited by the child process — no plaintext file ever exists. Example `start.sh`:
 
 ```bash
@@ -164,16 +220,19 @@ Users will ask you to use their API keys, passwords, and credentials for tasks l
 
 ### Common patterns
 
-**Load secrets and run something that uses them:**
+**Always prefer `load-secrets-from-agent` over `load-secrets-secure`** for interactive sessions — it gives the user a one-popup-per-session experience.
+
+**Load secrets and run something that uses them (auto-starts agent if needed):**
 ```bash
-cd <dir-with-secrets.env.enc> && source ~/secrets-manager.sh && load-secrets-secure && curl -H "Authorization: Bearer $OPENAI_API_KEY" https://api.openai.com/v1/models
+cd <dir-with-secrets.env.enc> && source ~/secrets-manager.sh && load-secrets-from-agent && curl -H "Authorization: Bearer $OPENAI_API_KEY" https://api.openai.com/v1/models
 ```
+First time in a session: master password popup. Subsequent calls in the same session: no popup unless requesting a key from a category not yet authorized.
 
 **Start a long-running process with no plaintext on disk:**
 ```bash
-cd <dir> && source ~/secrets-manager.sh && load-secrets-secure && exec bun run start
+cd <dir> && source ~/secrets-manager.sh && load-secrets-from-agent --bulk && exec bun run start
 ```
-Or wrap this in a `start.sh` script for one-command launches. The bot inherits env vars from the parent shell.
+Bulk mode loads everything with one popup. Wrap this in a `start.sh` script for one-command launches. The bot inherits env vars from the parent shell.
 
 **Add a new secret (user value never enters your context):**
 ```bash
@@ -183,13 +242,19 @@ Tell the user: "A popup will appear. Enter the master password, then fill in the
 
 **Check if a secret is set without revealing the value:**
 ```bash
-cd <dir> && source ~/secrets-manager.sh && load-secrets-secure && [ -n "$X_API_KEY" ] && echo "yes, set" || echo "not set"
+cd <dir> && source ~/secrets-manager.sh && load-secrets-from-agent && [ -n "$X_API_KEY" ] && echo "yes, set" || echo "not set"
 ```
 
 **List available secret names (no values, safe to read):**
 ```bash
 cd <dir> && cat secrets.env.template
 ```
+
+**NEVER do these (they leak values into your context):**
+- `bun secrets-agent.ts get KEY` — outputs the value as an export line. Always use the bash wrapper `load-secrets-from-agent` instead, which captures the output via `$(...)` and immediately `eval`s it.
+- `bun secrets-agent.ts dump` / `dump-all` — same issue. The CLI guards against this and refuses to run without explicit override, but don't try to bypass it.
+- `echo $SECRET_VAR` — duh.
+- Reading `secrets.env` with the Read tool.
 
 ### What to add to the user's CLAUDE.md
 
@@ -202,10 +267,12 @@ This project uses the encrypted-secrets-manager. Secrets are in `secrets.env.enc
 
 **Rules:**
 - NEVER read `secrets.env` with the Read tool — it dumps all credentials into context
+- NEVER run `bun secrets-agent.ts get/dump` directly — they print values
 - Reference secrets as `$VARIABLE_NAME` in shell commands
-- To use secrets: `cd <dir> && source ~/secrets-manager.sh && load-secrets-secure && <command>`
-- To add a new secret: `cd <dir> && source ~/secrets-manager.sh && add-secret-gui` (preferred — no value typing)
-- To start a long-running process: `cd <dir> && source ~/secrets-manager.sh && load-secrets-secure && exec <command>` (or wrap in a `start.sh` script — env vars inherit, no plaintext on disk)
+- To use secrets: `cd <dir> && source ~/secrets-manager.sh && load-secrets-from-agent && <command>`
+  - First call per session: master password popup. Subsequent calls: no popup unless requesting a key from a new category.
+- To add a new secret: `cd <dir> && source ~/secrets-manager.sh && add-secret-gui` (GUI form — value never enters context)
+- To start a long-running process: `cd <dir> && source ~/secrets-manager.sh && load-secrets-from-agent --bulk && exec <command>` (one popup loads everything, env vars inherit, no plaintext on disk)
 
 Full instructions in this repo's README.md.
 ```

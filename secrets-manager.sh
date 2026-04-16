@@ -615,17 +615,110 @@ remove-secret() {
     fi
 }
 
+# ─── Secrets Agent (long-running daemon for one-popup-per-session UX) ──
+# The agent holds decrypted secrets in memory after one master-password entry,
+# so multiple shell invocations / Claude Code calls don't have to re-prompt.
+# Enforces category-based scoping: new categories trigger a fresh popup.
+# See ~/secrets-agent.ts for implementation, ~/secrets-categories.json for config.
+
+AGENT_SCRIPT="$HOME/secrets-agent.ts"
+
+# Wrapper: secrets-agent <start|stop|status|get|dump|dump-all>
+secrets-agent() {
+    if [ ! -f "$AGENT_SCRIPT" ]; then
+        echo -e "${RED}Error: $AGENT_SCRIPT not found.${NC}"
+        return 1
+    fi
+    if ! command -v bun >/dev/null 2>&1; then
+        echo -e "${RED}Error: bun runtime not found. Install from https://bun.sh${NC}"
+        return 1
+    fi
+
+    local subcmd="${1:-status}"
+
+    if [ "$subcmd" = "start" ]; then
+        # Start in background so it survives this shell exit.
+        # Use nohup so it detaches; output goes to log file.
+        local log_file="$HOME/.secrets-agent/agent.log"
+        mkdir -p "$HOME/.secrets-agent" 2>/dev/null
+        nohup bun "$AGENT_SCRIPT" start > "$log_file" 2>&1 &
+        disown 2>/dev/null
+        # Wait for password popup + startup
+        sleep 2
+        if bun "$AGENT_SCRIPT" status >/dev/null 2>&1; then
+            echo -e "${GREEN}Secrets Agent started.${NC}"
+            bun "$AGENT_SCRIPT" status
+        else
+            echo -e "${RED}Failed to start agent. Check $log_file${NC}"
+            return 1
+        fi
+        return 0
+    fi
+
+    bun "$AGENT_SCRIPT" "$@"
+}
+
+# Load secrets via the agent (auto-starts agent if not running).
+# Use this in place of load-secrets-secure when you want the one-popup-per-session UX.
+# Optional: load-secrets-from-agent --bulk     (popup once, load EVERYTHING)
+load-secrets-from-agent() {
+    if [ ! -f "$AGENT_SCRIPT" ]; then
+        echo -e "${YELLOW}Agent script missing — falling back to load-secrets-secure${NC}"
+        load-secrets-secure
+        return $?
+    fi
+
+    # Auto-start agent if not running
+    if ! bun "$AGENT_SCRIPT" status >/dev/null 2>&1; then
+        echo "Agent not running — starting it (password popup)..."
+        secrets-agent start || return 1
+    fi
+
+    local mode="dump"
+    if [ "${1:-}" = "--bulk" ] || [ "${1:-}" = "--all" ]; then
+        mode="dump-all"
+    fi
+
+    # Pull export lines from agent and eval them in current shell.
+    # SECRETS_AGENT_INTERNAL=1 confirms to the agent that we're inside the
+    # bash wrapper (where output is captured by $(...) and eval'd, never
+    # displayed to the user/AI).
+    local export_lines
+    export_lines=$(SECRETS_AGENT_INTERNAL=1 bun "$AGENT_SCRIPT" "$mode" 2>/dev/null)
+    if [ -z "$export_lines" ]; then
+        echo -e "${YELLOW}No keys returned from agent (no categories unlocked yet?)${NC}"
+        echo "Try: load-secrets-from-agent --bulk  (loads everything with one popup)"
+        return 1
+    fi
+
+    eval "$export_lines"
+    local count
+    count=$(echo "$export_lines" | grep -c '^export ')
+    echo -e "${GREEN}Loaded $count secrets from agent.${NC}"
+    return 0
+}
+
 # Show available commands
 show-secrets-help() {
     echo "Secrets Manager Commands:"
-    echo "  unlock-secrets       - Decrypt $ENCRYPTED_FILE to $SECRETS_FILE (manual lock needed)"
-    echo "  lock-secrets         - Encrypt $SECRETS_FILE to $ENCRYPTED_FILE and delete plaintext"
-    echo "  toggle-secrets       - Auto lock/unlock based on current state"
-    echo "  load-secrets         - Load from plaintext file into env vars"
-    echo "  load-secrets-secure  - Popup password, decrypt to env vars only (never writes to disk)"
-    echo "  add-secret KEY VAL   - Add/update a secret (decrypt to memory, modify, re-encrypt)"
-    echo "  add-secret-gui       - GUI popup form: name + value + confirm value (no command typing)"
-    echo "  remove-secret KEY    - Remove a secret by name"
+    echo ""
+    echo "Recommended (Agent — one popup per session, category-scoped):"
+    echo "  secrets-agent start         - Start the agent (master password popup)"
+    echo "  secrets-agent status        - Show running state, idle time, unlocked categories"
+    echo "  secrets-agent stop          - Stop the agent (forces re-auth on next use)"
+    echo "  load-secrets-from-agent     - Load currently-unlocked keys into env vars"
+    echo "  load-secrets-from-agent --bulk - Load ALL keys (one popup unlocks everything)"
+    echo ""
+    echo "Direct (no agent — popup every time):"
+    echo "  load-secrets-secure         - Popup password, decrypt to env vars only"
+    echo ""
+    echo "Manage encrypted secrets:"
+    echo "  add-secret-gui              - GUI popup form: name + value + confirm value"
+    echo "  add-secret KEY VAL          - CLI version (value visible in shell history)"
+    echo "  remove-secret KEY           - Remove a secret by name"
+    echo "  unlock-secrets              - Decrypt to plaintext file (manual flow)"
+    echo "  lock-secrets                - Encrypt and delete plaintext"
+    echo "  toggle-secrets              - Auto lock/unlock"
     echo ""
     echo "Current status:"
     if [ -f "$SECRETS_FILE" ]; then
@@ -633,7 +726,14 @@ show-secrets-help() {
     else
         echo -e "  ${GREEN}LOCKED${NC} - Secrets are encrypted"
     fi
+    if [ -f "$AGENT_SCRIPT" ] && command -v bun >/dev/null 2>&1; then
+        if bun "$AGENT_SCRIPT" status >/dev/null 2>&1; then
+            echo -e "  ${GREEN}AGENT RUNNING${NC}"
+        else
+            echo -e "  ${YELLOW}Agent not running${NC} (run: secrets-agent start)"
+        fi
+    fi
 }
 
 echo -e "${GREEN}Secrets Manager loaded!${NC}"
-echo "Commands: unlock-secrets, lock-secrets, load-secrets-secure, add-secret-gui, show-secrets-help"
+echo "Commands: secrets-agent, load-secrets-from-agent, load-secrets-secure, add-secret-gui, show-secrets-help"
